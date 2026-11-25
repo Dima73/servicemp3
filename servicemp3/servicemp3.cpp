@@ -455,6 +455,8 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	m_buffer_size = 5 * 1024 * 1024;
 	m_ignore_buffering_messages = 0;
 	m_is_live = false;
+	m_pip_decoder = -1;
+	m_pip_applied = false;
 	m_use_prefillbuffer = false;
 	m_paused = false;
 	m_seek_paused = false;
@@ -925,12 +927,72 @@ RESULT eServiceMP3::connectEvent(const sigc::slot<void(iPlayableService*,int)> &
 	return 0;
 }
 
+/*
+ * PiP support. PictureInPicture calls setTarget(1, true) before start(): play
+ * video only, on hardware decoder 1. The playbin already exists (built in the
+ * constructor), so the target is only recorded here and applied from start().
+ * Requires a dvbvideosink with the "decoder" property; without it we refuse.
+ */
+RESULT eServiceMP3::setTarget(int target, bool noaudio)
+{
+	if (target != 1 || !m_gst_playbin || m_state != stIdle)
+		return -1;
+	GstElementFactory *factory = gst_element_factory_find("dvbvideosink");
+	if (!factory)
+		return -1;
+	GstElement *probe = gst_element_factory_create(factory, NULL);
+	gst_object_unref(factory);
+	if (!probe)
+		return -1;
+	const bool hasDecoderProp = g_object_class_find_property(G_OBJECT_GET_CLASS(probe), "decoder") != NULL;
+	gst_object_unref(probe);
+	if (!hasDecoderProp)
+	{
+		eDebug("[eServiceMP3] setTarget: dvbvideosink has no 'decoder' property, PiP unsupported");
+		return -1;
+	}
+	m_pip_decoder = target;
+	return 0;
+}
+
+void eServiceMP3::applyPipTarget()
+{
+	if (m_pip_decoder < 0 || m_pip_applied || !m_gst_playbin)
+		return;
+	m_pip_applied = true;
+	guint flags = 0;
+	g_object_get(G_OBJECT(m_gst_playbin), "flags", &flags, NULL);
+	flags &= ~(GST_PLAY_FLAG_AUDIO | GST_PLAY_FLAG_TEXT);
+	g_object_set(G_OBJECT(m_gst_playbin), "flags", flags, NULL);
+	GstElement *vsink = gst_element_factory_make("dvbvideosink", "pip_videosink");
+	if (vsink)
+	{
+		/* free-running: no clock sync or preroll on the PiP sink, so it can't
+		 * influence the main service's timing. "sync"/"async" are ignored by
+		 * the sink, the e2- variants are the real switches. */
+		g_object_set(G_OBJECT(vsink), "decoder", (guint)m_pip_decoder, "e2-sync", FALSE, "e2-async", FALSE, NULL);
+		g_object_set(G_OBJECT(m_gst_playbin), "video-sink", vsink, NULL);
+	}
+	/* Belt and braces: with GST_PLAY_FLAG_AUDIO cleared playbin should never build
+	 * an audio chain, but if it ever did it would autoplug dvbaudiosink and open
+	 * the audio decoder, taking it from the main service. Hand it a fakesink. */
+	GstElement *asink = gst_element_factory_make("fakesink", "pip_audiosink");
+	if (asink)
+	{
+		g_object_set(G_OBJECT(asink), "sync", FALSE, "async", FALSE, NULL);
+		g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", asink, NULL);
+	}
+	eDebug("[eServiceMP3] PiP: video-only on decoder %d", m_pip_decoder);
+}
+
 RESULT eServiceMP3::start()
 {
 	ASSERT(m_state == stIdle);
 
 	if (m_gst_playbin)
 	{
+		applyPipTarget();
+
 		eDebug("[eServiceMP3] starting pipeline");
 		GstStateChangeReturn ret;
 		ret = gst_element_set_state (m_gst_playbin, GST_STATE_PLAYING);
@@ -1716,6 +1778,13 @@ RESULT eServiceMP3::selectTrack(unsigned int i)
 
 int eServiceMP3::selectAudioStream(int i)
 {
+	/* A PiP is video-only. Setting "current-audio" makes playbin select an audio
+	 * stream and build an audio chain regardless of the cleared AUDIO flag: it
+	 * autoplugs dvbaudiosink, whose start()/stop() open and flush the shared
+	 * audio0 device - killing the MAIN service's audio. Never touch it. */
+	if (m_pip_decoder >= 0)
+		return 0;
+
 	int current_audio;
 	g_object_set (G_OBJECT (m_gst_playbin), "current-audio", i, NULL);
 	g_object_get (G_OBJECT (m_gst_playbin), "current-audio", &current_audio, NULL);
@@ -1930,7 +1999,7 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						loadCuesheet();
 					updateEpgCacheNowNext();
 
-					if (!videoSink || m_ref.getData(0) == 2) // show radio pic
+					if (m_pip_decoder < 0 && (!videoSink || m_ref.getData(0) == 2)) // show radio pic
 					{
 						bool showRadioBackground = eConfigManager::getConfigBoolValue("config.misc.showradiopic", true);
 						std::string radio_pic = eConfigManager::getConfigValue(showRadioBackground ? "config.misc.radiopic" : "config.misc.blackradiopic");
